@@ -1,0 +1,11 @@
+#root { width: 100%; height: 100%; }
+
+/* Target the card itself */
+.compact-weather {
+    padding: 8px !important;
+}
+
+/* Target ALL text inside the card */
+.compact-weather * {
+    font-size: 12px !important;
+}
