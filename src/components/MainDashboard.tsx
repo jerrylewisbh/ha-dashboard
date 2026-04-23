@@ -172,10 +172,7 @@ export function MainDashboard() {
             <CustomEnvironmentCard onClick={() => setOpenPopup('weather')} />
           </div>
 
-          <div
-            style={styles.clickableCameraWrapperStyle}
-            onClick={() => setPopupCamera('camera.reolink_video_doorbell_camera_fluent')}
-          >
+          <div style={styles.clickableCameraWrapperStyle} onClick={() => setPopupCamera('camera.reolink_video_doorbell_camera_fluent')}>
             {/* Click Catcher ensures the click registers on the wrapper */}
             <div style={styles.clickCatcherStyle} />
             <CameraCard

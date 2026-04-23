@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
-import { useEntity, useService } from '@hakit/core';
+import { useEntity, useService, useHass } from '@hakit/core';
 import type { EntityName } from '@hakit/core';
 import { Icon } from '@iconify/react';
 import Keyboard from 'react-simple-keyboard';
@@ -7,7 +7,7 @@ import 'react-simple-keyboard/build/css/index.css';
 import * as S from '../styles/MediaDashboard.styles';
 
 // --- CONFIG ---
-const MASS_URL = '/mass-api';
+const MASS_URL = (import.meta.env.VITE_MASS_API_URL as string) || '/mass-api';
 const MASS_TOKEN = import.meta.env.VITE_MASS_TOKEN as string;
 const PARTY_URL = import.meta.env.VITE_MASS_PARTY_URL as string;
 
@@ -20,11 +20,22 @@ interface MassMediaItem {
   metadata?: { images?: { url?: string; path?: string }[] };
 }
 
-interface MassSearchResponse {
-  tracks?: MassMediaItem[];
-  albums?: MassMediaItem[];
-  playlists?: MassMediaItem[];
+interface HaBrowseItem {
+  title: string;
+  media_content_type: string;
+  media_content_id: string;
+  thumbnail?: string | null;
+  can_play: boolean;
+  can_expand: boolean;
+  children?: HaBrowseItem[] | null;
 }
+
+const mapBrowseItemToMass = (item: HaBrowseItem): MassMediaItem => ({
+  uri: item.media_content_id,
+  name: item.title,
+  media_type: item.media_content_type.replace(/^music_assistant_(library_)?/, ''),
+  image_url: item.thumbnail ?? undefined,
+});
 
 interface MassQueueItem {
   queue_item_id: string;
@@ -115,6 +126,28 @@ export function MediaDashboard() {
 
   const keyboardRef = useRef<{ setInput: (input: string) => void } | null>(null);
   const lyricLineRefs = useRef<(HTMLDivElement | null)[]>([]);
+
+  const connection = useHass(state => state.connection);
+  const auth = useHass(state => state.auth);
+
+  // Discover the real backend ingress URL for MASS via the authenticated WebSocket connection.
+  // In dev the Vite proxy handles /app/d5369777_music_assistant so this stays null (falls back to MASS_URL).
+  // In production the supervisor/api WS command returns the /api/hassio_ingress/{token}/ path which
+  // HA proxies to MASS without any cross-origin restrictions.
+  const massIngressRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (!connection || import.meta.env.DEV) return;
+    connection
+      .sendMessagePromise<{ ingress_url?: string }>({
+        type: 'supervisor/api',
+        endpoint: '/addons/d5369777_music_assistant/info',
+        method: 'get',
+      })
+      .then(data => {
+        if (data?.ingress_url) massIngressRef.current = data.ingress_url;
+      })
+      .catch(() => {});
+  }, [connection]);
 
   const massQueueService = useService('mass_queue' as never) as unknown as MassQueueService;
   const musicAssistantService = useService('music_assistant' as never) as unknown as MusicAssistantService;
@@ -282,24 +315,21 @@ export function MediaDashboard() {
         setResults([]);
         return;
       }
+      if (!connection) return;
       try {
-        const response = await fetch(MASS_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${MASS_TOKEN}` },
-          body: JSON.stringify({
-            message_id: Date.now().toString(),
-            command: 'music/search',
-            args: { search_query: q, media_types: ['track', 'album', 'playlist'], limit: 30 },
-          }),
+        const res = await connection.sendMessagePromise<{ result: HaBrowseItem[] }>({
+          type: 'media_player/search_media',
+          entity_id: selectedEntity as string,
+          search_query: q,
+          media_content_type: 'music',
+          media_content_id: '',
         });
-        if (!response.ok) throw new Error(`Music Assistant: ${response.status} ${response.statusText}`);
-        const data = (await response.json()) as MassSearchResponse;
-        setResults([...(data.tracks || []), ...(data.albums || []), ...(data.playlists || [])]);
+        setResults((res.result || []).map(mapBrowseItemToMass));
       } catch (error) {
         console.error('Search failed:', error);
       }
     },
-    [viewMode]
+    [viewMode, connection, selectedEntity]
   );
 
   useEffect(() => {
@@ -309,34 +339,54 @@ export function MediaDashboard() {
     return () => clearTimeout(timer);
   }, [query, handleSearch]);
 
-  const fetchLibrary = useCallback(async (type: 'playlists' | 'albums' | 'tracks') => {
-    setQuery('');
-    setViewMode(type);
-    setShowKeyboard(false);
-    setShowPartyMode(false);
-    if (keyboardRef.current) keyboardRef.current.setInput('');
-    try {
-      const response = await fetch(MASS_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${MASS_TOKEN}` },
-        body: JSON.stringify({ message_id: Date.now().toString(), command: `music/${type}/library_items`, args: { limit: 100 } }),
-      });
-      if (!response.ok) throw new Error(`Music Assistant: ${response.status} ${response.statusText}`);
-      type LibraryResponse = MassMediaItem[] | { items?: MassMediaItem[]; result?: MassMediaItem[] | { items?: MassMediaItem[] } };
-      const data = (await response.json()) as LibraryResponse;
-      let items: MassMediaItem[] = [];
-      if (Array.isArray(data)) items = data;
-      else {
-        const result = data.result;
-        if (Array.isArray(result)) items = result;
-        else if (result && Array.isArray(result.items)) items = result.items;
-        else if (Array.isArray(data.items)) items = data.items;
+  const fetchLibrary = useCallback(
+    async (type: 'playlists' | 'albums' | 'tracks') => {
+      setQuery('');
+      setViewMode(type);
+      setShowKeyboard(false);
+      setShowPartyMode(false);
+      if (keyboardRef.current) keyboardRef.current.setInput('');
+
+      try {
+        const base = massIngressRef.current;
+
+        if (base) {
+          // HA ingress requires an ingress_session cookie (path=/api/hassio_ingress/).
+          // Creating the session with the HA access token sets that cookie, which the
+          // browser then sends automatically on the subsequent ingress fetch.
+          const sessionRes = await fetch('/api/hassio/ingress/session', {
+            method: 'POST',
+            headers: auth?.accessToken ? { Authorization: `Bearer ${auth.accessToken}` } : {},
+          }).catch(() => null);
+          if (!sessionRes?.ok) {
+            console.warn('Ingress session:', sessionRes?.status ?? 'network error', '— library fetch will likely fail');
+          }
+        }
+
+        const url = base ? `${base.replace(/\/$/, '')}/api` : MASS_URL;
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${MASS_TOKEN}` },
+          body: JSON.stringify({ message_id: Date.now().toString(), command: `music/${type}/library_items`, args: { limit: 100 } }),
+        });
+        if (!response.ok) throw new Error(`Music Assistant: ${response.status} ${response.statusText}`);
+        type LibraryResponse = MassMediaItem[] | { items?: MassMediaItem[]; result?: MassMediaItem[] | { items?: MassMediaItem[] } };
+        const data = (await response.json()) as LibraryResponse;
+        let items: MassMediaItem[] = [];
+        if (Array.isArray(data)) items = data;
+        else {
+          const result = data.result;
+          if (Array.isArray(result)) items = result;
+          else if (result && Array.isArray(result.items)) items = result.items;
+          else if (Array.isArray(data.items)) items = data.items;
+        }
+        setResults(items);
+      } catch (error) {
+        console.error('Library failed:', error);
       }
-      setResults(items);
-    } catch (error) {
-      console.error('Library failed:', error);
-    }
-  }, []);
+    },
+    [auth]
+  );
 
   const performAction = (item: MassMediaItem, action: 'play' | 'replace' | 'next' | 'add') => {
     setShowKeyboard(false);

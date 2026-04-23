@@ -26,15 +26,23 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   const massToken = env.VITE_MASS_TOKEN;
 
+  // Derive the MASS host from VITE_HA_URL so the dev proxy uses the same IP
+  // rather than relying on homeassistant.local mDNS resolution, which can be flaky.
+  let massProxyTarget = 'http://homeassistant.local:8095';
+  try {
+    const haUrl = new URL(env.VITE_HA_URL);
+    massProxyTarget = `http://${haUrl.hostname}:8095`;
+  } catch (_) {}
+
   return {
     base: `/local/${VITE_FOLDER_NAME}/`,
     plugins: [react()],
     server: {
       proxy: {
-        '/mass-api': {
-          target: 'http://homeassistant.local:8095',
+        '/app/d5369777_music_assistant': {
+          target: massProxyTarget,
           changeOrigin: true,
-          rewrite: path => path.replace(/^\/mass-api/, '/api'),
+          rewrite: path => path.replace('/app/d5369777_music_assistant', ''),
           headers: massToken ? { Authorization: `Bearer ${massToken}` } : {},
         },
       },
