@@ -128,7 +128,6 @@ export function MediaDashboard() {
   const lyricLineRefs = useRef<(HTMLDivElement | null)[]>([]);
 
   const connection = useHass(state => state.connection);
-  const auth = useHass(state => state.auth);
 
   // Discover the real backend ingress URL for MASS via the authenticated WebSocket connection.
   // In dev the Vite proxy handles /app/d5369777_music_assistant so this stays null (falls back to MASS_URL).
@@ -148,6 +147,40 @@ export function MediaDashboard() {
       })
       .catch(() => {});
   }, [connection]);
+
+  // Create/refresh the HA ingress session via the already-authenticated WebSocket connection.
+  // The Supervisor creates the session (same as HA's own frontend does internally) and we
+  // write the ingress_session cookie ourselves — it is not HttpOnly so JS can set it.
+  const refreshIngressSession = useCallback(async (): Promise<boolean> => {
+    if (!massIngressRef.current || !connection) return !massIngressRef.current;
+    try {
+      const data = await connection.sendMessagePromise<{ session?: string }>({
+        type: 'supervisor/api',
+        endpoint: '/ingress/session',
+        method: 'post',
+      });
+      const sessionToken = data?.session;
+      if (sessionToken) {
+        document.cookie = `ingress_session=${sessionToken}; path=/api/hassio_ingress/; max-age=600; SameSite=Lax`;
+        return true;
+      }
+      return false;
+    } catch {
+      return false;
+    }
+  }, [connection]);
+
+  // Keep the ingress session alive — HA expires it after ~30 min, so refresh every 20 min.
+  useEffect(() => {
+    if (import.meta.env.DEV) return;
+    const id = setInterval(
+      () => {
+        void refreshIngressSession();
+      },
+      20 * 60 * 1000
+    );
+    return () => clearInterval(id);
+  }, [refreshIngressSession]);
 
   const massQueueService = useService('mass_queue' as never) as unknown as MassQueueService;
   const musicAssistantService = useService('music_assistant' as never) as unknown as MusicAssistantService;
@@ -349,26 +382,26 @@ export function MediaDashboard() {
 
       try {
         const base = massIngressRef.current;
-
-        if (base) {
-          // HA ingress requires an ingress_session cookie (path=/api/hassio_ingress/).
-          // Creating the session with the HA access token sets that cookie, which the
-          // browser then sends automatically on the subsequent ingress fetch.
-          const sessionRes = await fetch('/api/hassio/ingress/session', {
-            method: 'POST',
-            headers: auth?.accessToken ? { Authorization: `Bearer ${auth.accessToken}` } : {},
-          }).catch(() => null);
-          if (!sessionRes?.ok) {
-            console.warn('Ingress session:', sessionRes?.status ?? 'network error', '— library fetch will likely fail');
-          }
-        }
+        if (base) await refreshIngressSession();
 
         const url = base ? `${base.replace(/\/$/, '')}/api` : MASS_URL;
-        const response = await fetch(url, {
+        const body = JSON.stringify({ message_id: Date.now().toString(), command: `music/${type}/library_items`, args: { limit: 100 } });
+        let response = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${MASS_TOKEN}` },
-          body: JSON.stringify({ message_id: Date.now().toString(), command: `music/${type}/library_items`, args: { limit: 100 } }),
+          body,
         });
+
+        // Session cookie may have just expired — refresh and retry once.
+        if (response.status === 401 && base) {
+          await refreshIngressSession();
+          response = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${MASS_TOKEN}` },
+            body,
+          });
+        }
+
         if (!response.ok) throw new Error(`Music Assistant: ${response.status} ${response.statusText}`);
         type LibraryResponse = MassMediaItem[] | { items?: MassMediaItem[]; result?: MassMediaItem[] | { items?: MassMediaItem[] } };
         const data = (await response.json()) as LibraryResponse;
@@ -385,7 +418,7 @@ export function MediaDashboard() {
         console.error('Library failed:', error);
       }
     },
-    [auth]
+    [refreshIngressSession]
   );
 
   const performAction = (item: MassMediaItem, action: 'play' | 'replace' | 'next' | 'add') => {
