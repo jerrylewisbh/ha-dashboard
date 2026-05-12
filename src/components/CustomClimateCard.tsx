@@ -10,11 +10,26 @@ export const CustomClimateCard = ({ onClick }: CustomClimateCardProps) => {
   const climate = useEntity('climate.nest_thermostat');
   const currentTemp = climate.attributes.current_temperature;
   const targetTemp = climate.attributes.temperature;
+  const targetLow = climate.attributes.target_temp_low;
+  const targetHigh = climate.attributes.target_temp_high;
   const mode = climate.state;
 
   const setMode = (e: React.MouseEvent, newMode: string) => {
     e.stopPropagation(); // ✋ This stops the popup from opening when clicking buttons
     climate.service.setHvacMode({ serviceData: { hvac_mode: newMode } });
+  };
+
+  const renderTargetTemp = () => {
+    if (mode === 'heat_cool') {
+      return (
+        <span style={{ display: 'flex', alignItems: 'center', gap: '4px' }}>
+          <span style={{ color: '#ff5722' }}>{targetLow?.toFixed(0) ?? '--'}°</span>
+          <span style={{ color: 'rgba(255,255,255,0.2)' }}>-</span>
+          <span style={{ color: '#03a9f4' }}>{targetHigh?.toFixed(0) ?? '--'}°</span>
+        </span>
+      );
+    }
+    return `${targetTemp?.toFixed(0) ?? '--'}°`;
   };
 
   return (
@@ -28,9 +43,9 @@ export const CustomClimateCard = ({ onClick }: CustomClimateCardProps) => {
 
           {/* UPDATED: Split the values into a highly readable flex row */}
           <div style={styles.climateStatusContainerStyle}>
-            <span style={styles.climateCurrentValueStyle}>{currentTemp}°</span>
+            <span style={styles.climateCurrentValueStyle}>{currentTemp?.toFixed(0)}°</span>
             <span style={styles.climateTargetLabelStyle}>Target</span>
-            <span style={styles.climateTargetValueStyle}>{targetTemp}°</span>
+            <span style={styles.climateTargetValueStyle}>{renderTargetTemp()}</span>
           </div>
         </div>
       </div>
